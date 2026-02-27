@@ -126,6 +126,16 @@ async def init_app(
 async def run_server(
     args: Namespace, llm_engine: AsyncLLMEngine | None = None, **uvicorn_kwargs: Any
 ) -> None:
+    # ===== 自定义修改开始 =====
+    print("=" * 70)
+    print("🚀 [CUSTOM] vLLM服务器启动 - first-test分支")
+    print(f"🚀 [CUSTOM] 模型路径: {args.model}")
+    print(f"🚀 [CUSTOM] 服务端口: {args.port}")
+    print(f"🚀 [CUSTOM] 数据类型: {args.dtype}")
+    print(f"🚀 [CUSTOM] Git修改立即生效！")
+    print("=" * 70)
+    # ===== 自定义修改结束 =====
+    
     logger.info("vLLM API server version %s", VLLM_VERSION)
     logger.info("args: %s", args)
 
