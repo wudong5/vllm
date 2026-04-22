@@ -7,6 +7,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
+from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -20,10 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    _swizzle_mxfp4,
-    get_padding_alignment,
-)
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import _swizzle_mxfp4
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
@@ -57,8 +55,8 @@ class Mxfp4MoeBackend(Enum):
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
-    # ROCm AITER (CK)
-    CK = "CK"
+    # ROCm AITER
+    AITER = "AITER"
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
@@ -104,7 +102,7 @@ def backend_to_kernel_cls(
         return [FlashInferExperts]
 
     elif backend == Mxfp4MoeBackend.TRITON:
-        from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
             OAITritonExperts,
             OAITritonMxfp4ExpertsMonolithic,
         )
@@ -113,7 +111,7 @@ def backend_to_kernel_cls(
         return [OAITritonMxfp4ExpertsMonolithic, OAITritonExperts]
 
     elif backend == Mxfp4MoeBackend.TRITON_UNFUSED:
-        from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
             UnfusedOAITritonExperts,
         )
 
@@ -133,7 +131,7 @@ def backend_to_kernel_cls(
 
         return [BatchedMarlinExperts]
 
-    elif backend == Mxfp4MoeBackend.CK:
+    elif backend == Mxfp4MoeBackend.AITER:
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
             AiterExperts,
         )
@@ -141,12 +139,15 @@ def backend_to_kernel_cls(
         return [AiterExperts]
 
     elif backend == Mxfp4MoeBackend.XPU:
-        raise NotImplementedError("XPU backend uses XpuMxfp4MoEMethod directly.")
+        from vllm.model_executor.layers.fused_moe.xpu_fused_moe import XPUExpertsMXFp4
+
+        return [XPUExpertsMXFp4]
+
     else:
         raise ValueError(f"Unknown MXFP4 MoE backend: {backend.value}")
 
 
-def map_mxfp4_backend(runner_backend: str) -> Mxfp4MoeBackend:
+def map_mxfp4_backend(runner_backend: MoEBackend) -> Mxfp4MoeBackend:
     """Map user's moe_backend string to Mxfp4MoeBackend."""
     mapping: dict[str, Mxfp4MoeBackend] = {
         "flashinfer_trtllm": Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
@@ -155,7 +156,8 @@ def map_mxfp4_backend(runner_backend: str) -> Mxfp4MoeBackend:
         "flashinfer_cutlass_afp8": Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
         "triton": Mxfp4MoeBackend.TRITON,
         "marlin": Mxfp4MoeBackend.MARLIN,
-        "ck": Mxfp4MoeBackend.CK,
+        "aiter": Mxfp4MoeBackend.AITER,
+        "xpu": Mxfp4MoeBackend.XPU,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -172,12 +174,13 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     """
     _AVAILABLE_BACKENDS = [
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
-        Mxfp4MoeBackend.CK,
+        Mxfp4MoeBackend.AITER,
         Mxfp4MoeBackend.TRITON,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
+        Mxfp4MoeBackend.XPU,
     ]
     return _AVAILABLE_BACKENDS
 
@@ -192,22 +195,28 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     return None
 
 
-def select_mxfp4_moe_backend(
+def select_gpt_oss_mxfp4_moe_backend(
     config: FusedMoEConfig,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """
     Select the primary MXFP4 MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
     """
-    triton_kernels_supported = has_triton_kernels() and (
-        9,
-        0,
-    ) <= current_platform.get_device_capability() < (11, 0)
+    device_capability = current_platform.get_device_capability()
+    triton_kernels_supported = (
+        has_triton_kernels()
+        and device_capability is not None
+        and (9, 0) <= device_capability < (11, 0)
+    )
 
     # LoRA: separate experts backend path
     if config.is_lora_enabled:
         if not current_platform.is_cuda():
-            raise NotImplementedError("Mxfp4 LoRA only supported on CUDA Platform.")
+            # ROCm: Triton mxfp4 LoRA hits GPU memory faults due to
+            # triton_kernels.tensor.Tensor / HIP read-only page issues
+            # during weight swizzle and LoRA forward. Needs work from
+            # the triton_kernels/aiter side.
+            raise NotImplementedError("Mxfp4 LoRA is currently only supported on CUDA.")
         if envs.VLLM_MXFP4_USE_MARLIN is False and triton_kernels_supported:
             logger.info_once("Using Triton backend for mxfp4 lora")
             return Mxfp4MoeBackend.TRITON_UNFUSED, backend_to_kernel_cls(
@@ -351,7 +360,13 @@ def select_mxfp4_moe_backend(
     if current_platform.is_xpu():
         backend = Mxfp4MoeBackend.XPU
         logger.info_once(_make_log_backend(backend))
-        return backend, None
+        return _return_or_raise(
+            Mxfp4MoeBackend.XPU,
+            config,
+            kMxfp4Static,
+            None,
+            activation_format,
+        )
 
     if current_platform.is_cuda() or current_platform.is_rocm():
         raise NotImplementedError(
@@ -381,15 +396,14 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif current_platform.is_rocm():
-        pad_align = get_padding_alignment()
-        intermediate_size = round_up(intermediate_size, pad_align)
-        hidden_size = round_up(hidden_size, pad_align)
+        intermediate_size = round_up(intermediate_size, 256)
+        hidden_size = round_up(hidden_size, 256)
     else:
         intermediate_size = round_up(intermediate_size, 64)
     return hidden_size, intermediate_size
 
 
-def convert_to_mxfp4_moe_kernel_format(
+def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     mxfp4_backend: Mxfp4MoeBackend,
     layer: torch.nn.Module,
     w13_weight: torch.Tensor,
@@ -415,7 +429,10 @@ def convert_to_mxfp4_moe_kernel_format(
 
     sf_block_size = 32  # mxfp4 block size
 
-    if mxfp4_backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
+    if mxfp4_backend in (
+        Mxfp4MoeBackend.MARLIN,
+        Mxfp4MoeBackend.BATCHED_MARLIN,
+    ):
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
             prepare_moe_mxfp4_layer_for_marlin,
         )
@@ -645,7 +662,7 @@ def convert_to_mxfp4_moe_kernel_format(
                 w2_bias,
             )
 
-    elif mxfp4_backend == Mxfp4MoeBackend.CK:
+    elif mxfp4_backend == Mxfp4MoeBackend.AITER:
         from vllm._aiter_ops import rocm_aiter_ops
 
         if w13_bias is not None:
@@ -741,6 +758,16 @@ def convert_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.XPU:
+        # No additional transformation needed for XPU backend
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend: {mxfp4_backend}: "
@@ -773,7 +800,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
-        Mxfp4MoeBackend.CK,
+        Mxfp4MoeBackend.AITER,
     ):
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=w1_bias,
@@ -838,7 +865,6 @@ def make_mxfp4_moe_kernel(
             if moe_config.moe_parallel_config.use_deepep_ll_kernels
             else None
         ),
-        moe_parallel_config=moe_config.moe_parallel_config,
         inplace=(
             not moe_config.disable_inplace and mxfp4_backend not in TRTLLM_BACKENDS
         ),
